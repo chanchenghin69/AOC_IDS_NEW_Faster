@@ -14,6 +14,7 @@ from sklearn.metrics import accuracy_score,confusion_matrix, precision_score, re
 import scipy.optimize as opt
 import torch.distributions as dist
 from sklearn.metrics import accuracy_score
+from sklearn.mixture import BayesianGaussianMixture
 
 def load_data(data_path):
     data = pd.read_csv(data_path)
@@ -160,109 +161,120 @@ def log_likelihood(params, data):
     pdf2 = gaussian_pdf(data, mu2, sigma2)
     return -np.sum(np.log(0.5 * pdf1 + 0.5 * pdf2))
 
-@torch.no_grad()
-def evaluate(normal_temp, normal_recon_temp, x_train, y_train, x_test, y_test, model, get_confidence=False, en_or_de=False, return_predictions=False):
-    normal_mask = (y_train == 0).squeeze()
-    abnormal_mask = (y_train == 1).squeeze()
+def fit_bgmm(X, n_components=10, reg_covar=1e-4, random_state=5009):
+    bgmm = BayesianGaussianMixture(
+        n_components=n_components,
+        covariance_type='full',
+        weight_concentration_prior_type='dirichlet_process',
+        reg_covar=reg_covar,
+        max_iter=300,
+        init_params='kmeans',
+        random_state=random_state
+    )
+    bgmm.fit(X)
+    return bgmm
 
-    # One forward pass for all training data (was 8 passes, now 2)
+@torch.no_grad()
+def evaluate(
+    normal_temp,
+    normal_recon_temp,
+    x_train,
+    y_train,
+    x_test,
+    y_test,
+    model,
+    get_confidence=False,
+    en_or_de=False,
+    return_predictions=False,
+    n_components=10,
+    reg_covar=1e-4,
+    random_state=5009
+):
+    # 兼容 tensor / numpy
+    if isinstance(y_train, torch.Tensor):
+        y_train_np = y_train.detach().cpu().numpy()
+    else:
+        y_train_np = np.asarray(y_train)
+
+    normal_mask = (y_train_np == 0).squeeze()
+    abnormal_mask = (y_train_np == 1).squeeze()
+
+    # 前向：train
     train_enc, train_dec = model(x_train)
-    train_features = F.normalize(train_enc, p=2, dim=1)
-    train_recon = F.normalize(train_dec, p=2, dim=1)
+    train_features = F.normalize(train_enc, p=2, dim=1).detach().cpu().numpy()
+    train_recon = F.normalize(train_dec, p=2, dim=1).detach().cpu().numpy()
 
     train_features_normal = train_features[normal_mask]
     train_features_abnormal = train_features[abnormal_mask]
     train_recon_normal = train_recon[normal_mask]
     train_recon_abnormal = train_recon[abnormal_mask]
 
-    # One forward pass for test data
+    # 前向：test
     test_enc, test_dec = model(x_test)
-    test_features = F.normalize(test_enc, p=2, dim=1)
-    test_recon = F.normalize(test_dec, p=2, dim=1)
+    test_features = F.normalize(test_enc, p=2, dim=1).detach().cpu().numpy()
+    test_recon = F.normalize(test_dec, p=2, dim=1).detach().cpu().numpy()
 
-    normal_temp_r = normal_temp.reshape(1, -1)
-    normal_recon_temp_r = normal_recon_temp.reshape(1, -1)
+    # ========== Encoder branch: BGMM ==========
+    bgmm_feat_normal = fit_bgmm(
+        train_features_normal,
+        n_components=n_components,
+        reg_covar=reg_covar,
+        random_state=random_state
+    )
+    bgmm_feat_abnormal = fit_bgmm(
+        train_features_abnormal,
+        n_components=n_components,
+        reg_covar=reg_covar,
+        random_state=random_state
+    )
 
-    values_features_all, _ = torch.sort(F.cosine_similarity(train_features, normal_temp_r, dim=1))
-    values_features_normal, _ = torch.sort(F.cosine_similarity(train_features_normal, normal_temp_r, dim=1))
-    values_features_abnormal, _ = torch.sort(F.cosine_similarity(train_features_abnormal, normal_temp_r, dim=1))
+    logp_feat_normal = bgmm_feat_normal.score_samples(test_features)
+    logp_feat_abnormal = bgmm_feat_abnormal.score_samples(test_features)
 
-    values_features_all = values_features_all.cpu().detach().numpy()
+    y_test_pred_en = (logp_feat_abnormal > logp_feat_normal).astype("int32")
+    y_test_pro_en = np.abs(logp_feat_abnormal - logp_feat_normal).astype("float32")
 
-    values_features_test = F.cosine_similarity(test_features, normal_temp_r)
+    # ========== Decoder branch: BGMM ==========
+    bgmm_recon_normal = fit_bgmm(
+        train_recon_normal,
+        n_components=n_components,
+        reg_covar=reg_covar,
+        random_state=random_state
+    )
+    bgmm_recon_abnormal = fit_bgmm(
+        train_recon_abnormal,
+        n_components=n_components,
+        reg_covar=reg_covar,
+        random_state=random_state
+    )
 
-    values_recon_all, _ = torch.sort(F.cosine_similarity(train_recon, normal_recon_temp_r, dim=1))
-    values_recon_normal, _ = torch.sort(F.cosine_similarity(train_recon_normal, normal_recon_temp_r, dim=1))
-    values_recon_abnormal, _ = torch.sort(F.cosine_similarity(train_recon_abnormal, normal_recon_temp_r, dim=1))
+    logp_recon_normal = bgmm_recon_normal.score_samples(test_recon)
+    logp_recon_abnormal = bgmm_recon_abnormal.score_samples(test_recon)
 
-    values_recon_all = values_recon_all.cpu().detach().numpy()
+    y_test_pred_de = (logp_recon_abnormal > logp_recon_normal).astype("int32")
+    y_test_pro_de = np.abs(logp_recon_abnormal - logp_recon_normal).astype("float32")
 
-    values_recon_test = F.cosine_similarity(test_recon, normal_recon_temp_r, dim=1)
+    # ========== 融合 ==========
+    y_test_pred_final = np.where(
+        y_test_pro_en > y_test_pro_de,
+        y_test_pred_en,
+        y_test_pred_de
+    ).astype("int32")
 
-    mu1_initial = np.mean(values_features_normal.cpu().detach().numpy())
-    sigma1_initial = np.std(values_features_normal.cpu().detach().numpy())
+    # 只预测，不算指标
+    if isinstance(y_test, int):
+        return torch.from_numpy(y_test_pred_final)
 
-    mu2_initial = np.mean(values_features_abnormal.cpu().detach().numpy())
-    sigma2_initial = np.std(values_features_abnormal.cpu().detach().numpy())
-
-    # Fitting data to two Gaussian distributions using Maximum Likelihood Estimation (MLE)
-    initial_params = np.array([mu1_initial, sigma1_initial, mu2_initial, sigma2_initial]) # Initial parameters
-    result = opt.minimize(log_likelihood, initial_params, args=(values_features_all,), method='Nelder-Mead')
-    mu1_fit, sigma1_fit, mu2_fit, sigma2_fit = result.x # Estimated parameter values
-
-    if mu1_fit > mu2_fit:
-        gaussian1 = dist.Normal(mu1_fit, sigma1_fit)
-        gaussian2 = dist.Normal(mu2_fit, sigma2_fit)
+    # 评估
+    if isinstance(y_test, torch.Tensor):
+        y_test_np = y_test.detach().cpu().numpy()
     else:
-        gaussian2 = dist.Normal(mu1_fit, sigma1_fit)
-        gaussian1 = dist.Normal(mu2_fit, sigma2_fit)
+        y_test_np = np.asarray(y_test)
 
-    pdf1 = gaussian1.log_prob(values_features_test).exp()
+    result_encoder = score_detail(y_test_np, y_test_pred_en)
+    result_decoder = score_detail(y_test_np, y_test_pred_de)
+    result_final = score_detail(y_test_np, y_test_pred_final, if_print=True)
 
-    pdf2 = gaussian2.log_prob(values_features_test).exp()
-    y_test_pred_2 = (pdf2 > pdf1).cpu().numpy().astype("int32")
-    y_test_pro_en = (torch.abs(pdf2-pdf1)).cpu().detach().numpy().astype("float32")
-
-    if isinstance(y_test, int) == False:
-        if y_test.device != torch.device("cpu"):
-            y_test = y_test.cpu().numpy()
-
-    mu3_initial = np.mean(values_recon_normal.cpu().detach().numpy())
-    sigma3_initial = np.std(values_recon_normal.cpu().detach().numpy())
-
-    mu4_initial = np.mean(values_recon_abnormal.cpu().detach().numpy())
-    sigma4_initial = np.std(values_recon_abnormal.cpu().detach().numpy())
-
-    # Fitting data to two Gaussian distributions using Maximum Likelihood Estimation (MLE)
-    initial_params = np.array([mu3_initial, sigma3_initial, mu4_initial, sigma4_initial]) # Initial parameters
-    result = opt.minimize(log_likelihood, initial_params, args=(values_recon_all,), method='Nelder-Mead')
-    mu3_fit, sigma3_fit, mu4_fit, sigma4_fit = result.x # Estimated parameter values
-
-    if mu3_fit > mu4_fit:
-        gaussian3 = dist.Normal(mu3_fit, sigma3_fit)
-        gaussian4 = dist.Normal(mu4_fit, sigma4_fit)
-    else:
-        gaussian4 = dist.Normal(mu3_fit, sigma3_fit)
-        gaussian3 = dist.Normal(mu4_fit, sigma4_fit)
-
-    pdf3 = gaussian3.log_prob(values_recon_test).exp()
-
-    pdf4 = gaussian4.log_prob(values_recon_test).exp()
-    y_test_pred_4 = (pdf4 > pdf3).cpu().numpy().astype("int32")
-    y_test_pro_de = (torch.abs(pdf4-pdf3)).cpu().detach().numpy().astype("float32")
-
-    if not isinstance(y_test, int):
-        if y_test.device != torch.device("cpu"):
-            y_test = y_test.cpu().numpy()
-        result_encoder = score_detail(y_test, y_test_pred_2)
-        result_decoder = score_detail(y_test, y_test_pred_4)
-
-    y_test_pred_no_vote = torch.where(torch.from_numpy(y_test_pro_en) > torch.from_numpy(y_test_pro_de), torch.from_numpy(y_test_pred_2), torch.from_numpy(y_test_pred_4))
-    
-    if not isinstance(y_test, int):
-        result_final = score_detail(y_test, y_test_pred_no_vote, if_print=True)
-        if return_predictions:
-            return result_encoder, result_decoder, result_final, y_test_pred_no_vote.numpy()
-        return result_encoder, result_decoder, result_final
-    else:
-        return y_test_pred_no_vote
+    if return_predictions:
+        return result_encoder, result_decoder, result_final, y_test_pred_final
+    return result_encoder, result_decoder, result_final
