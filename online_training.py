@@ -87,8 +87,8 @@ elif dataset == 'unsw':
     x_test, y_test = splitter_unsw.transform(UNSWTest, labels='label')
 
 else:  # cic
-    CICTrain_dataset_path = "CIC_pre_data/CICTrain.csv"
-    CICTest_dataset_path  = "CIC_pre_data/CICTest.csv"
+    CICTrain_dataset_path = "/kaggle/input/datasets/chenghinchan/cic-pre-data/CICTrain.csv"
+    CICTest_dataset_path  = "/kaggle/input/datasets/chenghinchan/cic-pre-data/CICTest.csv"
 
     CICTrain = load_data(CICTrain_dataset_path)
     CICTest  = load_data(CICTest_dataset_path)
