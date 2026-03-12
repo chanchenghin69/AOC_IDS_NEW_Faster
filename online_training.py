@@ -13,6 +13,10 @@ from visualization import plot_training_summary
 import argparse
 import warnings
 
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+
 warnings.filterwarnings('ignore')
 
 parser = argparse.ArgumentParser(description='manual to this script')
@@ -24,6 +28,11 @@ parser.add_argument("--flip_percent", type=float, default=0.2)
 parser.add_argument("--sample_interval", type=int, default=2000)
 parser.add_argument("--cuda", type=str, default="0")
 
+# 新增
+parser.add_argument("--bgmm_components", type=int, default=10)
+parser.add_argument("--bgmm_reg_covar", type=float, default=1e-4)
+
+
 args = parser.parse_args()
 dataset = args.dataset
 epochs = args.epochs
@@ -32,6 +41,8 @@ percent = args.percent
 flip_percent = args.flip_percent
 sample_interval = args.sample_interval
 cuda_num = args.cuda
+bgmm_components = args.bgmm_components
+bgmm_reg_covar = args.bgmm_reg_covar
 
 tem = 0.02
 bs = 128
@@ -76,8 +87,8 @@ elif dataset == 'unsw':
     x_test, y_test = splitter_unsw.transform(UNSWTest, labels='label')
 
 else:  # cic
-    CICTrain_dataset_path = "/kaggle/input/datasets/chenghinchan/cic-pre-data/CICTrain.csv"
-    CICTest_dataset_path  = "/kaggle/input/datasets/chenghinchan/cic-pre-data/CICTest.csv"
+    CICTrain_dataset_path = "CIC_pre_data/CICTrain.csv"
+    CICTest_dataset_path  = "CIC_pre_data/CICTest.csv"
 
     CICTrain = load_data(CICTrain_dataset_path)
     CICTest  = load_data(CICTest_dataset_path)
@@ -175,7 +186,18 @@ for i in range(seed_round):
             enc, dec = model(normal_data)
             normal_temp = torch.mean(F.normalize(enc, p=2, dim=1), dim=0)
             normal_recon_temp = torch.mean(F.normalize(dec, p=2, dim=1), dim=0)
-        predict_label = evaluate(normal_temp, normal_recon_temp, x_train_this_epoch, y_train_detection, x_test_this_epoch, 0, model)
+        predict_label = evaluate(
+            normal_temp,
+            normal_recon_temp,
+            x_train_this_epoch,
+            y_train_detection,
+            x_test_this_epoch,
+            0,
+            model,
+            n_components=bgmm_components,
+            reg_covar=bgmm_reg_covar,
+            random_state=seed+i
+        )
 
         y_true_np = y_true_this_step.cpu().numpy()
         y_pred_np = predict_label.cpu().numpy() if isinstance(predict_label, torch.Tensor) else np.array(predict_label)
@@ -235,8 +257,18 @@ for i in range(seed_round):
         normal_recon_temp = torch.mean(F.normalize(dec, p=2, dim=1), dim=0)
 
     res_en, res_de, res_final, y_pred_final = evaluate(
-        normal_temp, normal_recon_temp, x_train_this_epoch, y_train_detection,
-        x_test, y_test, model, return_predictions=True)
+        normal_temp,
+        normal_recon_temp,
+        x_train_this_epoch,
+        y_train_detection,
+        x_test,
+        y_test,
+        model,
+        return_predictions=True,
+        n_components=bgmm_components,
+        reg_covar=bgmm_reg_covar,
+        random_state=seed+i
+    )
 
     print(f'\n{"=" * 60}')
     print(f'  Final Results - {dataset.upper()} seed={seed+i}')
@@ -264,6 +296,8 @@ for i in range(seed_round):
             'input_dim': input_dim,
             'num_first_train': num_of_first_train,
             'timestamp': timestamp,
+            'bgmm_components': bgmm_components,
+            'bgmm_reg_covar': bgmm_reg_covar,
         },
         'stage1_losses': first_round_losses,
         'stage2_losses': online_losses,
