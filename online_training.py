@@ -19,8 +19,8 @@ from visualization import plot_training_summary
 warnings.filterwarnings("ignore")
 
 START_TIME = time.time()
-# MAX_RUN_SECONDS = 11.5 * 3600   # Kaggle 12h 前提前自救
-MAX_RUN_SECONDS = 600   # Kaggle 12h 前提前自救
+MAX_RUN_SECONDS = 11.5 * 3600   # Kaggle 12h 前提前自救
+# MAX_RUN_SECONDS = 600   # Kaggle 12h 前提前自救
 
 
 def save_checkpoint(path, model, optimizer, count,
