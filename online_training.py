@@ -151,8 +151,8 @@ def main():
 
     elif dataset == "cic":
         input_dim = None
-        train_path = "CIC_pre_data/CICTrain.csv"
-        test_path = "CIC_pre_data/CICTest.csv"
+        train_path = "/kaggle/input/datasets/chenghinchan/cic-pre-data/CICTrain.csv"
+        test_path = "/kaggle/input/datasets/chenghinchan/cic-pre-data/CICTest.csv"
 
         train_df = load_data(train_path)
         test_df = load_data(test_path)
