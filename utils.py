@@ -174,6 +174,13 @@ def fit_bgmm(X, n_components=10, reg_covar=1e-4, random_state=5009):
     bgmm.fit(X)
     return bgmm
 
+def capped_sample(X, max_samples, seed=5009):
+    if len(X) <= max_samples:
+        return X
+    rng = np.random.default_rng(seed)
+    idx = rng.choice(len(X), size=max_samples, replace=False)
+    return X[idx]
+
 @torch.no_grad()
 def evaluate(
     normal_temp,
@@ -188,7 +195,8 @@ def evaluate(
     return_predictions=False,
     n_components=10,
     reg_covar=1e-4,
-    random_state=5009
+    random_state=5009,
+    max_fit_samples=5000
 ):
     # 兼容 tensor / numpy
     if isinstance(y_train, torch.Tensor):
@@ -208,6 +216,11 @@ def evaluate(
     train_features_abnormal = train_features[abnormal_mask]
     train_recon_normal = train_recon[normal_mask]
     train_recon_abnormal = train_recon[abnormal_mask]
+    
+    train_features_normal = capped_sample(train_features_normal, max_fit_samples, random_state)
+    train_features_abnormal = capped_sample(train_features_abnormal, max_fit_samples, random_state + 1)
+    train_recon_normal = capped_sample(train_recon_normal, max_fit_samples, random_state + 2)
+    train_recon_abnormal = capped_sample(train_recon_abnormal, max_fit_samples, random_state + 3)
 
     # 前向：test
     test_enc, test_dec = model(x_test)
